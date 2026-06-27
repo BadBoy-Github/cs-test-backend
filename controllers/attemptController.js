@@ -1,0 +1,545 @@
+const Attempt = require('../models/Attempt');
+const Answer = require('../models/Answer');
+const Test = require('../models/Test');
+const Question = require('../models/Question');
+const User = require('../models/User');
+const { sendResultEmail } = require('../services/emailService');
+
+// Helper function to update user streak
+const updateUserStreak = async (userId, attemptDate) => {
+  const user = await User.findById(userId);
+  if (!user) return;
+
+  const today = new Date(attemptDate);
+  today.setHours(0, 0, 0, 0);
+  
+  const studyDates = user.studyDates || [];
+  const todayAlreadyAdded = studyDates.some(d => {
+    const dDate = new Date(d);
+    dDate.setHours(0, 0, 0, 0);
+    return dDate.getTime() === today.getTime();
+  });
+
+  if (!todayAlreadyAdded) {
+    studyDates.push(today);
+    user.studyDates = studyDates;
+  }
+
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  const hasToday = studyDates.some(d => {
+    const dDate = new Date(d);
+    dDate.setHours(0, 0, 0, 0);
+    return dDate.getTime() === today.getTime();
+  });
+  
+  const hasYesterday = studyDates.some(d => {
+    const dDate = new Date(d);
+    dDate.setHours(0, 0, 0, 0);
+    return dDate.getTime() === yesterday.getTime();
+  });
+
+  if (hasToday && hasYesterday) {
+    user.streak = (user.streak || 0) + 1;
+  } else if (hasToday) {
+    user.streak = 1;
+  }
+
+  user.lastAttemptDate = attemptDate;
+  await user.save();
+};
+
+exports.startAttempt = async (req, res) => {
+  try {
+    const test = await Test.findById(req.params.testId);
+    if (!test) return res.status(404).json({ message: 'Test not found' });
+
+    if (!test.isActive) return res.status(400).json({ message: 'Test is not currently available' });
+
+    const existingAttempts = await Attempt.countDocuments({
+      testId: req.params.testId,
+      userId: req.user.id,
+      status: 'completed'
+    });
+    if (existingAttempts >= test.maxAttempts) {
+      return res.status(400).json({
+        message: 'Maximum attempts reached',
+        attemptsUsed: existingAttempts,
+        maxAttempts: test.maxAttempts
+      });
+    }
+
+    const ongoingAttempt = await Attempt.findOne({
+      testId: req.params.testId,
+      userId: req.user.id,
+      status: 'ongoing'
+    });
+
+    if (ongoingAttempt) {
+      return res.status(200).json(ongoingAttempt);
+    }
+
+    const attempt = new Attempt({ testId: req.params.testId, userId: req.user.id });
+    await attempt.save();
+    res.status(201).json(attempt);
+  } catch (err) {
+    console.log('Start attempt error:', err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+exports.submitAnswer = async (req, res) => {
+  const { questionId, userAnswer, timeTaken } = req.body;
+  try {
+    const attempt = await Attempt.findOne({ _id: req.params.attemptId, userId: req.user.id }).populate('testId');
+    if (!attempt) return res.status(404).json({ message: 'Attempt not found' });
+
+    const question = await Question.findById(questionId);
+    if (!question) return res.status(404).json({ message: 'Question not found' });
+
+    // Check if answer is being cleared (empty)
+    const isEmpty = question.type === 'checkbox'
+      ? (Array.isArray(userAnswer) && userAnswer.length === 0)
+      : userAnswer === '' || userAnswer == null;
+
+    if (isEmpty) {
+      // Remove any existing answer for this question (clear)
+      await Answer.deleteMany({ attemptId: req.params.attemptId, questionId });
+      return res.json({ cleared: true });
+    }
+
+    const test = attempt.testId;
+
+    let isCorrect = false;
+    let marksObtained = 0;
+
+    if ((question.type === 'mcq' || question.type === 'checkbox') && question.correctAnswer) {
+      const correctAnswers = Array.isArray(question.correctAnswer) ? question.correctAnswer : [question.correctAnswer];
+      const userAnswers = Array.isArray(userAnswer) ? userAnswer : [userAnswer];
+
+      if (question.type === 'mcq') {
+        isCorrect = correctAnswers.length === 1 && userAnswers.length === 1 && correctAnswers[0] === userAnswers[0];
+      } else if (question.type === 'checkbox') {
+        isCorrect = correctAnswers.length === userAnswers.length &&
+                   correctAnswers.every(ans => userAnswers.includes(ans)) &&
+                   userAnswers.every(ans => correctAnswers.includes(ans));
+      }
+
+      if (isCorrect) {
+        marksObtained = question.marks;
+      } else if (test.negativeMarking) {
+        marksObtained = -test.negativeMarkingValue;
+      }
+    } else if (question.type === 'descriptive' || question.type === 'coding') {
+      if (question.correctAnswer) {
+        const correctAnswer = Array.isArray(question.correctAnswer)
+          ? question.correctAnswer[0]
+          : question.correctAnswer;
+
+        const userAns = typeof userAnswer === 'string' ? userAnswer.trim().toLowerCase() : '';
+        const correctAns = typeof correctAnswer === 'string' ? correctAnswer.trim().toLowerCase() : '';
+
+        isCorrect = userAns !== '' && userAns === correctAns;
+
+        if (isCorrect) {
+          marksObtained = question.marks;
+        } else if (test.negativeMarking) {
+          marksObtained = -test.negativeMarkingValue;
+        }
+      } else {
+        isCorrect = false;
+        marksObtained = 0;
+      }
+    }
+
+    // Remove any existing answers for this question to prevent duplicates
+    await Answer.deleteMany({ attemptId: req.params.attemptId, questionId });
+
+    const answer = new Answer({
+      attemptId: req.params.attemptId,
+      questionId,
+      userAnswer,
+      isCorrect,
+      marksObtained,
+      timeTaken
+    });
+    await answer.save();
+
+    res.json(answer);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+exports.completeAttempt = async (req, res) => {
+  try {
+    const attempt = await Attempt.findOneAndUpdate(
+      { _id: req.params.attemptId, userId: req.user.id },
+      { isCompleted: true, endTime: new Date(), status: 'completed' },
+      { new: true }
+    ).populate('testId');
+
+    if (!attempt) return res.status(404).json({ message: 'Attempt not found' });
+
+    const allAnswers = await Answer.find({ attemptId: req.params.attemptId });
+
+    // Deduplicate: keep only the latest answer per question
+    const latestMap = new Map();
+    allAnswers.forEach(ans => {
+      const qId = ans.questionId.toString();
+      const existing = latestMap.get(qId);
+      if (!existing || new Date(ans.submittedAt) > new Date(existing.submittedAt)) {
+        latestMap.set(qId, ans);
+      }
+    });
+    const answers = Array.from(latestMap.values());
+
+    // Delete duplicate answers from DB to keep clean
+    if (allAnswers.length > answers.length) {
+      const keptIds = answers.map(a => a._id);
+      await Answer.deleteMany({
+        attemptId: req.params.attemptId,
+        _id: { $nin: keptIds }
+      });
+    }
+
+    const totalScore = answers.reduce((sum, ans) => sum + ans.marksObtained, 0);
+
+    const startTime = new Date(attempt.startTime);
+    const endTime = new Date();
+    const totalTime = (endTime - startTime) / 60000;
+
+    const test = attempt.testId;
+    const maxScore = test.totalMarks || 0;
+
+    attempt.score = totalScore;
+    attempt.totalTime = totalTime;
+    attempt.passed = maxScore > 0 && (totalScore / maxScore) * 100 >= test.passingScore;
+    attempt.isFirstAttempt = !(await Attempt.exists({
+      testId: attempt.testId,
+      userId: attempt.userId,
+      status: 'completed',
+      _id: { $ne: attempt._id }
+    }));
+    await attempt.save();
+
+    updateUserStreak(req.user.id, new Date());
+
+    // Send result email to student (async, don't block response)
+    try {
+      const student = await User.findById(req.user.id).select('name email');
+      if (student) {
+        sendResultEmail({
+          email: student.email,
+          userName: student.name,
+          testTitle: test.title,
+          score: totalScore,
+          totalMarks: maxScore
+        }).catch(err => console.error('Failed to send result email:', err.message));
+      }
+    } catch (err) {
+      console.error('Error fetching student for result email:', err.message);
+    }
+
+    res.json(attempt);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+exports.getResults = async (req, res) => {
+  try {
+    const attempts = await Attempt.find({ userId: req.user.id, isCompleted: true })
+      .populate('testId', 'title showResults totalMarks createdAt')
+      .sort({ createdAt: -1 });
+
+    const validAttempts = attempts.filter(attempt => attempt.testId);
+
+    const results = await Promise.all(validAttempts.map(async (attempt) => {
+      // Fetch test questions
+      const testQuestions = await Question.find({ testId: attempt.testId._id }).sort({ order: 1 });
+
+      // Fetch answers (sorted newest first)
+      let answers = await Answer.find({ attemptId: attempt._id })
+        .populate({
+          path: 'questionId',
+          select: 'questionText type correctAnswer explanation marks options imageUrl'
+        })
+        .sort({ submittedAt: -1 });
+
+      // Build map of latest answer per question
+      const latestAnswerMap = new Map();
+      answers.forEach(ans => {
+        const qId = ans.questionId?._id?.toString();
+        if (qId) {
+          const existing = latestAnswerMap.get(qId);
+          if (!existing || new Date(ans.submittedAt) > new Date(existing.submittedAt)) {
+            latestAnswerMap.set(qId, ans);
+          }
+        }
+      });
+
+      // Merge all test questions with their answers (or empty if unanswered)
+      const mergedAnswers = testQuestions.map(q => {
+        const savedAnswer = latestAnswerMap.get(q._id.toString());
+        if (savedAnswer) {
+          return {
+            _id: savedAnswer._id,
+            attemptId: savedAnswer.attemptId,
+            questionId: savedAnswer.questionId,
+            userAnswer: savedAnswer.userAnswer,
+            isCorrect: savedAnswer.isCorrect,
+            marksObtained: savedAnswer.marksObtained,
+            timeTaken: savedAnswer.timeTaken,
+            submittedAt: savedAnswer.submittedAt
+          };
+        } else {
+          return {
+            _id: null,
+            attemptId: attempt._id,
+            questionId: q,
+            userAnswer: q.type === 'checkbox' ? [] : '',
+            isCorrect: false,
+            marksObtained: 0,
+            timeTaken: 0,
+            submittedAt: null
+          };
+        }
+      });
+
+      // Hide correct answers/explanation if results not released
+      let detailedAnswers = mergedAnswers;
+      if (!attempt.testId.showResults) {
+        detailedAnswers = mergedAnswers.map(answer => {
+          const q = answer.questionId.toObject ? answer.questionId.toObject() : answer.questionId;
+          return {
+            ...answer,
+            questionId: {
+              ...q,
+              correctAnswer: undefined,
+              explanation: undefined
+            }
+          };
+        });
+      }
+
+      return {
+        ...attempt.toObject(),
+        answers: detailedAnswers
+      };
+    }));
+
+    res.json(results);
+  } catch (err) {
+    console.error('Get results error:', err);
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
+};
+
+exports.getTestResultsAdmin = async (req, res) => {
+  try {
+    const attempts = await Attempt.find({ testId: req.params.testId, isCompleted: true })
+      .populate('userId', 'name email')
+      .sort({ endTime: -1 });
+
+    const userMap = {};
+    attempts.forEach(attempt => {
+      const userId = attempt.userId._id.toString();
+      if (!userMap[userId]) {
+        userMap[userId] = {
+          _id: userId,
+          name: attempt.userId.name,
+          email: attempt.userId.email,
+          attempts: []
+        };
+      }
+      userMap[userId].attempts.push({
+        _id: attempt._id,
+        number: userMap[userId].attempts.length + 1,
+        score: attempt.score,
+        endTime: attempt.endTime,
+        totalTime: attempt.totalTime
+      });
+    });
+
+    const students = Object.values(userMap).map(student => {
+      student.attempts.sort((a, b) => new Date(b.endTime) - new Date(a.endTime));
+      student.attempts.forEach((attempt, index) => {
+        attempt.number = student.attempts.length - index;
+      });
+      student.latestScore = student.attempts[0].score;
+      return student;
+    });
+
+    students.sort((a, b) => b.latestScore - a.latestScore);
+
+    res.json(students);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+exports.getAttemptAdmin = async (req, res) => {
+  try {
+    const attempt = await Attempt.findById(req.params.attemptId)
+      .populate('testId', 'title showResults totalMarks')
+      .populate('userId', 'name email');
+
+    if (!attempt) return res.status(404).json({ message: 'Attempt not found' });
+
+    // Fetch test questions
+    const testQuestions = await Question.find({ testId: attempt.testId._id }).sort({ order: 1 });
+
+    let answers = await Answer.find({ attemptId: attempt._id })
+      .populate({
+        path: 'questionId',
+        select: 'questionText type correctAnswer explanation marks options imageUrl'
+      })
+      .sort({ submittedAt: -1 }); // newest first
+
+    // Build latest answer map
+    const latestAnswerMap = new Map();
+    answers.forEach(ans => {
+      const qId = ans.questionId?._id?.toString();
+      if (qId) {
+        const existing = latestAnswerMap.get(qId);
+        if (!existing || new Date(ans.submittedAt) > new Date(existing.submittedAt)) {
+          latestAnswerMap.set(qId, ans);
+        }
+      }
+    });
+
+    // Merge with all test questions
+    const mergedAnswers = testQuestions.map(q => {
+      const savedAnswer = latestAnswerMap.get(q._id.toString());
+      if (savedAnswer) {
+        return {
+          _id: savedAnswer._id,
+          attemptId: savedAnswer.attemptId,
+          questionId: savedAnswer.questionId,
+          userAnswer: savedAnswer.userAnswer,
+          isCorrect: savedAnswer.isCorrect,
+          marksObtained: savedAnswer.marksObtained,
+          timeTaken: savedAnswer.timeTaken,
+          submittedAt: savedAnswer.submittedAt
+        };
+      } else {
+        return {
+          _id: null,
+          attemptId: attempt._id,
+          questionId: q,
+          userAnswer: q.type === 'checkbox' ? [] : '',
+          isCorrect: false,
+          marksObtained: 0,
+          timeTaken: 0,
+          submittedAt: null
+        };
+      }
+    });
+
+    res.json({
+      ...attempt.toObject(),
+      answers: mergedAnswers
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+  exports.getLeaderboard = async (req, res) => {
+    try {
+      const users = await User.find({ role: 'student' })
+        .select('name email streak')
+        .sort({ streak: -1 });
+
+      const leaderboard = await Promise.all(users.map(async (user) => {
+        const attempts = await Attempt.find({ userId: user._id, isCompleted: true });
+        const scores = attempts.map(a => a.score).filter(s => s != null);
+        const averageScore = scores.length > 0
+          ? scores.reduce((sum, s) => sum + s, 0) / scores.length
+          : 0;
+        const times = attempts.map(a => a.totalTime).filter(t => t != null);
+        const bestTime = times.length > 0 ? Math.min(...times) : null;
+
+        return {
+          userId: { _id: user._id, name: user.name, email: user.email },
+          averageScore: Math.round(averageScore),
+          testsTaken: attempts.length,
+          streak: user.streak || 0,
+          bestTime
+        };
+      }));
+
+      leaderboard.sort((a, b) => {
+        // Primary: tests taken DESC (more tests taken ranks higher)
+        if (b.testsTaken !== a.testsTaken) return b.testsTaken - a.testsTaken;
+        // Secondary: average score DESC (higher average ranks higher)
+        if (b.averageScore !== a.averageScore) return b.averageScore - a.averageScore;
+        // Tertiary: best time ASC (lower time ranks higher)
+        if (a.bestTime != null && b.bestTime != null) {
+          if (a.bestTime !== b.bestTime) return a.bestTime - b.bestTime;
+        }
+        // Quaternary: streak DESC (higher streak ranks higher)
+        return b.streak - a.streak;
+      });
+
+      res.json(leaderboard.map((entry, i) => ({ ...entry, rank: i + 1 })));
+    } catch (err) {
+      console.error('Leaderboard error:', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  };
+
+  exports.getLeaderboardByTest = async (req, res) => {
+    try {
+      const attempts = await Attempt.find({
+        testId: req.params.testId,
+        isCompleted: true
+      }).populate('userId', 'name email');
+
+      const userMap = {};
+      attempts.forEach(attempt => {
+        const userId = attempt.userId._id.toString();
+        if (!userMap[userId]) {
+          userMap[userId] = {
+            userId: { _id: userId, name: attempt.userId.name, email: attempt.userId.email },
+            scores: [],
+            bestScore: 0,
+            attempts: 0,
+            times: []
+          };
+        }
+        userMap[userId].scores.push(attempt.score);
+        userMap[userId].bestScore = Math.max(userMap[userId].bestScore, attempt.score);
+        userMap[userId].attempts++;
+        if (attempt.totalTime != null) {
+          userMap[userId].times.push(attempt.totalTime);
+        }
+      });
+
+      const leaderboard = Object.values(userMap)
+        .map(entry => ({
+          ...entry,
+          averageScore: Math.round(entry.scores.reduce((a, b) => a + b, 0) / entry.scores.length),
+          bestTime: entry.times.length > 0 ? Math.min(...entry.times) : null,
+          testsTaken: entry.attempts
+        }))
+        .sort((a, b) => {
+          // Primary: tests taken DESC
+          if (b.testsTaken !== a.testsTaken) return b.testsTaken - a.testsTaken;
+          // Secondary: average score DESC
+          if (b.averageScore !== a.averageScore) return b.averageScore - a.averageScore;
+          // Tertiary: best time ASC (lower time is better)
+          if (a.bestTime != null && b.bestTime != null) {
+            if (a.bestTime !== b.bestTime) return a.bestTime - b.bestTime;
+          }
+          return 0;
+        });
+
+      res.json(leaderboard.map((entry, i) => ({ ...entry, rank: i + 1 })));
+    } catch (err) {
+      console.error('Leaderboard by test error:', err);
+      res.status(500).json({ message: 'Server error' });
+    }
+  };
