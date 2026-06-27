@@ -45,9 +45,9 @@ mongoose.set('bufferTimeoutMS', 30000);
 app.use(helmet());
 app.use(cors({
   origin: (origin, cb) => {
-    const allowed = ['http://localhost:5173','http://localhost:3000','https://test-hive-frontend.vercel.app','https://test-hive-backend.vercel.app'];
+    const allowed = ['http://localhost:5173','https://code-scapex-test.vercel.app'];
     if (!origin) return cb(null, true);
-    cb(null, allowed.includes(origin) || /^https:\/\/test-hive-frontend-.*\.vercel\.app$/.test(origin));
+    cb(null, allowed.includes(origin) || /^https:\/\/test-hive-frontend-.*\.vercel\.app$/.test(origin) || /^https:\/\/code-scapex-test-.*\.vercel\.app$/.test(origin));
   },
   credentials: true,
    methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
