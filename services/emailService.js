@@ -10,7 +10,7 @@ const createTransporter = () => {
   });
 };
 
-const BASE_URL = 'https://codescapex.com';
+const BASE_URL = 'https://code-scapex-test.vercel.app';
 
 const baseStyles = `
   body {
@@ -179,7 +179,7 @@ const sendWelcomeEmail = async (user) => {
           
           <div class="footer">
             © 2026 Code Scapex. All rights reserved.<br><br>
-            <a href="${BASE_URL}">codescapex.com</a>
+            <a href="${BASE_URL}">code-scapex-test.vercel.app</a>
           </div>
         </div>
       </body>
@@ -231,7 +231,7 @@ const sendResultEmail = async ({ email, userName, testTitle, score, totalMarks }
           
           <div class="footer">
             © 2026 Code Scapex. All rights reserved.<br><br>
-            <a href="${BASE_URL}">codescapex.com</a>
+            <a href="${BASE_URL}">code-scapex-test.vercel.app</a>
           </div>
         </div>
       </body>
@@ -282,7 +282,7 @@ const sendReminderEmail = async ({ email, userName, testTitle, duration }) => {
           
           <div class="footer">
             © 2026 Code Scapex. All rights reserved.<br><br>
-            <a href="${BASE_URL}">codescapex.com</a>
+            <a href="${BASE_URL}">code-scapex-test.vercel.app</a>
           </div>
         </div>
       </body>
